@@ -55,22 +55,31 @@ def convert_hf_checkpoint(
     with open(model_map_json) as json_map:
         bin_index = json.load(json_map)
 
-    weight_map = {
-        "model.embed_tokens.weight": "tok_embeddings.weight",
-        "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
-        "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
-        "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
-        "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
-        'model.layers.{}.self_attn.rotary_emb.inv_freq': None,
-        'model.layers.{}.mlp.gate_proj.weight': 'layers.{}.feed_forward.w1.weight',
-        "model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
-        "model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
-        "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
-        "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
-        "model.norm.weight": "norm.weight",
-        "lm_head.weight": "output.weight",
-    }
-    bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
+        weight_map = {
+            "model.embed_tokens.weight": "tok_embeddings.weight",
+            "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
+            "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
+            "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
+            "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
+            'model.layers.{}.self_attn.rotary_emb.inv_freq': None,
+            'model.layers.{}.mlp.gate_proj.weight': 'layers.{}.feed_forward.w1.weight',
+            "model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
+            "model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
+            "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
+            "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
+            "model.norm.weight": "norm.weight",
+            "lm_head.weight": "output.weight",
+        }
+        bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
+    else:
+        # There is no separate pytorch_model.bin.index.json file for llama3.
+        # Instead, we will just use all original/consolidated.NN.pth files.
+        # so, we use model.safetensors.index.json
+        weight_map = None
+        original_dir = checkpoint_dir / "original"
+        pattern = re.compile(r"^consolidated\.\d{2}\.pth$")
+        bin_files = {bin for bin in original_dir.iterdir() if pattern.match(bin.name)}
+
 
     def permute(w, n_head):
         dim = config.dim
@@ -102,17 +111,14 @@ def convert_hf_checkpoint(
 
         final_result[new_key] = value
 
-    for key in tuple(final_result.keys()):
-        if "wq" in key:
-            q = final_result[key]
-            k = final_result[key.replace("wq", "wk")]
-            v = final_result[key.replace("wq", "wv")]
-            q = permute(q, config.n_head)
-            k = permute(k, config.n_local_heads)
-            final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
-            del final_result[key]
-            del final_result[key.replace("wq", "wk")]
-            del final_result[key.replace("wq", "wv")]
+        for key in tuple(final_result.keys()):
+            if "wq" in key:
+                q = final_result[key]
+                k = final_result[key.replace("wq", "wk")]
+                final_result[key] = permute(q, config.n_head)
+                final_result[key.replace("wq", "wk")] = permute(k, config.n_local_heads)
+    else:
+        final_result = merged_result
     print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
     torch.save(final_result, checkpoint_dir / "model.pth")
     if 'llama-3' in model_name.lower():
